@@ -2,94 +2,69 @@
 
 ## Cel projektu
 
-Znalezienie top 10 zamienników dla aparatu Premier PC-656 (zły auto-ekspozycja, słaba
-optyka) spośród 764 ogłoszeń z OLX.pl. Budżet 20–120 PLN. Kryterium: lepsze
-naświetlanie + 90s point-and-shoot vibe, NIE profesjonalny/SLR.
+Znalezienie wszystkich aparatów **zauważalnie lepszych** od Premier PC-656 (38mm f/4.5,
+stały fokus, CdS metering, bez DX) spośród 764 ogłoszeń z OLX.pl.
+Budżet 20–120 PLN. Film zawsze ISO 200. NIE SLR, NIE APS, NIE bridge.
 
-## Stan obecny
+## Stan projektu — ZAKOŃCZONY ✅
 
-- [x] Scraping zakończony — `cameras.db` zawiera **764 ogłoszeń** (tabela `listings`)
-- [ ] Analiza LLM — uruchomić `analyze.py` na serwerze z vLLM
-- [ ] Raport — uruchomić `report.py` po zakończeniu analizy
+- [x] Scraping — `cameras.db` zawiera **764 ogłoszeń**
+- [x] Filter pass 1 — regex odrzuca SLR/APS/Vectis/Ixus → **697 kandydatów**
+- [x] Fetch descriptions — httpx pobiera opisy OLX, wykrywa uszkodzone → **conditions.jsonl**
+- [x] Analiza roju agentów WebSearch — 78 batchy × 5 modeli → specs zweryfikowane online
+- [x] Raport — `top10.md` zawiera **~35 modeli** w Tier 1 / Tier 2 / Vintage + lista odrzuconych
+- [x] URL audit — wszystkie linki OLX pochdzą z `cameras.db` (nie halucynowane)
 
-## Wymagania serwera
+## Wynik
 
-- vLLM z modelem **Qwen3.5 397B VL** (multimodal, vision-language)
-- API: `http://localhost:8000/v1` (OpenAI-compatible)
-- Min. 8×A100 80GB GPU
+**`top10.md`** — lista wszystkich aparatów godnych zakupu z:
+- ceną, stanem ogłoszenia, przysłoną, typem AF/FF, DX coding
+- bezpośrednim linkiem OLX (ID z bazy, nie z palca)
+- ostrzeżeniami ⚠️ dla niesprawdzonych / ekstrapolowanych specs
 
-## Uruchomienie na serwerze
+## Pipeline — jak odtworzyć od zera
 
 ```bash
-# 1. Setup środowiska
-uv sync
-uv run playwright install chromium
+# 1. Dump z DB
+uv run python dump_listings.py          # → listings_dump.jsonl (764 wierszy)
 
-# 2. Test (5 ogłoszeń) — upewnij się że vLLM odpowiada
-uv run python analyze.py --limit 5
+# 2. Filtr regex (SLR/APS/Vectis/Ixus/focus-free)
+uv run python filter_pass1.py           # → candidates.jsonl (697)
 
-# 3. Pełna analiza (może działać kilka dni — to normalne)
-uv run python analyze.py
+# 3. Pobierz opisy OLX + wykryj uszkodzone
+uv run python fetch_descriptions.py     # → conditions.jsonl (697, ~20 req/s)
 
-# 4. Jeśli przerwane — resume automatyczny (INSERT OR IGNORE)
-uv run python analyze.py
+# 4. Rój agentów CC weryfikuje specs online (max 5 modeli / agent)
+# → wynik ręcznie scalony do top10.md
 
-# 5. Po zakończeniu — generuj raport
-uv run python report.py
-
-# 6. Export JSONL do re-scoringu innym modelem (opcjonalnie)
-uv run python export.py
-python analyze.py --rescore --model "inny-model"
-```
-
-## Architektura pipeline
-
-```
-listings (764 rows, scraped)
-    ↓
-analyze.py per listing:
-  Etap 0: httpx → listing_details (pełny opis + wszystkie zdjęcia)
-  Etap A: vLLM text call → text_extractions (model, marka, stan, confidence)
-  Etap B: DuckDuckGo + httpx → model_specs (cache per unikalny model)
-  Etap C: vLLM VL call (lazy, iteracyjny) → vision_obs_raw + vision_obs
-  Etap D: vLLM scoring call → scores (overall_score, reasoning, recommended)
-    ↓
-report.py → top10.md + top10.json
+# 5. Napraw halucynowane URL-e
+uv run python fix_urls.py               # poprawia ID w top10.md z cameras.db
 ```
 
 ## Pliki
 
 | Plik | Opis |
 |------|------|
-| `cameras.db` | SQLite — scraped data + wyniki analizy |
-| `scrape_olx.py` | Playwright scraper (już uruchomiony) |
-| `analyze.py` | Główny pipeline LLM |
-| `export.py` | Export JSONL do re-scoringu |
-| `report.py` | Generuje top10.md |
+| `cameras.db` | SQLite — 764 ogłoszeń (url, title, price, image_urls) |
+| `top10.md` | **WYNIK** — lista godnych aparatów z linkami OLX |
+| `scrape_olx.py` | Playwright scraper (jednorazowy) |
+| `dump_listings.py` | Dump cameras.db → listings_dump.jsonl |
+| `filter_pass1.py` | Regex filtr SLR/APS/focus-free |
+| `fetch_descriptions.py` | Async httpx — opisy OLX + detekcja uszkodzonych |
+| `fix_urls.py` | Naprawa URL-i w top10.md z bazy DB |
+| `analyze.py` | Stary pipeline vLLM (nieużywany — halucynował specs) |
+| `report.py` | Generator raportu (stary, pod analyze.py) |
 | `db.py` | Schema SQLite + connection helper |
 
-## Re-scoring z innym modelem
+## Kluczowe lekcje z projektu
 
-Wszystkie dane (opisy, specyfikacje, obserwacje wizualne) są zapisane w DB niezależnie
-od scoringu. Można przemielić scoring z GPT-5.6, GLM5.2 lub Claude bez ponownego
-scrapowania:
+- **vLLM/Qwen halucynował specs** (złe przysłony, zły format, zły AF) → przełączono na WebSearch
+- **Agenci muszą czytać PEŁNY opis OLX** — pierwsze 300 znaków może ukryć "sok w obiektywie"
+- **Nigdy nie pisać URL ręcznie** — ID OLX musi pochodzić z bazy (fix_urls.py pattern)
+- **DX coding** ≠ lepszy pomiar; to tylko automatyczny odczyt ISO z kasety
+- **CdS metering** degraduje się, SPD/SPC program AE jest nowocześniejszy
 
-```bash
-python analyze.py --rescore --model "nazwa-modelu"
-```
+## Kontynuacja / aktualizacja listy
 
-## Konfiguracja
-
-W `analyze.py` linia ~35:
-```python
-VLLM_BASE_URL = "http://localhost:8000/v1"  # zmień jeśli inny port
-CONCURRENCY = 4  # liczba równoległych callów vLLM — zwiększ jeśli GPU ma rezerwę
-```
-
-## Kontynuacja sesji Claude Code
-
-Jeśli chcesz kontynuować tę sesję na innej maszynie, powiedz Claude:
-
-> "Kontynuuj projekt OlxCameraFinder. Scraping zakończony (764 ogłoszenia w cameras.db).
-> Uruchom analyze.py na serwerze vLLM localhost:8000 z Qwen3.5 397B VL.
-> Sprawdź czy vLLM działa, przetestuj na 5 ogłoszeniach, potem uruchom pełną analizę."
+Jeśli pojawią się nowe ogłoszenia — uruchom ponownie scraper, potem pipeline od dump_listings.py.
+Wyniki agentów scalić ręcznie z top10.md (dodaj nowe modele, usuń sprzedane).

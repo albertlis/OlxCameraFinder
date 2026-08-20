@@ -74,15 +74,6 @@ def generate_reports(top_n: int = 10) -> None:
     for rank, row in enumerate(top_rows, 1):
         defects = json.loads(row["defects"] or "[]") if row["defects"] else []
         condition = row["vision_condition"] or row["text_condition"] or "nieznany"
-        specs = []
-        if row["focal_mm"]:
-            specs.append(f"{row['focal_mm']}mm")
-        if row["aperture_max"]:
-            specs.append(f"f/{row['aperture_max']}")
-        if row["metering_type"]:
-            specs.append(f"pomiar: {row['metering_type']}")
-        specs_str = ", ".join(specs) if specs else "brak danych"
-
         upgrades = []
         if row["metering_upgrade"]:
             upgrades.append("lepsze naświetlanie")
@@ -94,7 +85,6 @@ def generate_reports(top_n: int = 10) -> None:
             f"**Cena:** {row['price_pln']} PLN | **Ocena:** {row['overall_score']:.1f}/10",
             f"**Model:** {row['canonical_name'] or 'nieznany'}",
             f"**Stan:** {condition}" + (f" | Defekty: {', '.join(defects)}" if defects else ""),
-            f"**Specyfikacje:** {specs_str}",
             f"**Przewagi vs PC-656:** {', '.join(upgrades) or 'ogólnie lepszy'}",
             f"**Uzasadnienie:** {row['reasoning']}",
             f"**Link:** {row['url']}",

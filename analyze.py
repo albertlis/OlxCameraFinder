@@ -21,7 +21,7 @@ from typing import Any, Optional, TypeVar
 import httpx
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Literal
 
 from db import DB_PATH, init_db, connect
@@ -33,28 +33,54 @@ T = TypeVar("T", bound=BaseModel)
 # ---------------------------------------------------------------------------
 
 VLLM_BASE_URL = "http://localhost:8000/v1"
-CONCURRENCY = 4  # concurrent vLLM calls; tune per GPU headroom
-
-PREMIER_PC656 = {
-    "focal_mm": 38,
-    "aperture_max": 4.5,
-    "metering_type": "center",
-    "focus_type": "fixed",
-    "is_slr": False,
-    "notes": "Zawodny pomiar centralny, stały fokus, słaba jakość optyki",
-}
+SEARCH_BASE_URL = "http://localhost:8099"  # open-websearch HTTP API (SSH tunnel z Windows)
+CONCURRENCY = 8
+THINKING_BUDGET = 16000
+MAX_TOOL_ROUNDS = 5
 
 SYSTEM_SCORING = (
-    "Jesteś ekspertem aparatów analogowych. Oceniasz czy ogłoszenie to dobry zamiennik "
-    "dla Premier PC-656 (słaba ekspozycja, 38mm f/4.5, stały fokus, zawodny pomiar centralny). "
-    "Użytkownik chce: nieco lepsze naświetlanie, 90s point-and-shoot vibe, "
-    "NIE profesjonalny/SLR, budżet 20–120 PLN."
+    "Jesteś ekspertem aparatów analogowych lat 90. Szukasz zamiennika dla Premier PC-656 "
+    "(38mm f/4.5, stały fokus, zawodny pomiar centralny, słaba optyka). "
+    "Kryterium: lepsze naświetlanie + automatyka ekspozycji, 90s point-and-shoot vibe, NIE SLR, budżet 20–120 PLN.\n\n"
+    "INSTRUKCJA: Jeśli znasz markę/model aparatu, UŻYJ narzędzi wyszukiwania aby znaleźć "
+    "specyfikacje techniczne (ogniskowa mm, max przysłona f/, typ pomiaru ekspozycji, autofokus/fokus stały). "
+    "Szukaj precyzyjnie np. '{marka} {model} specifications film camera'. "
+    "Jeśli strona nie zawiera liczb — wejdź w link i czytaj dalej. Powtarzaj aż znajdziesz dane lub wyczerpiesz 5 prób."
 )
 
-DDGO_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+DDGO_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": "Wyszukaj w internecie specyfikacje aparatu fotograficznego.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_content",
+            "description": "Pobierz treść strony internetowej ze specyfikacją aparatu.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "max_length": {"type": "integer", "default": 6000},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+]
+
 OLX_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "pl-PL,pl;q=0.9",
@@ -94,7 +120,7 @@ class VisionObsRaw(BaseModel):
 
 
 class ListingScore(BaseModel):
-    overall_score: float  # 1.0–10.0
+    overall_score: float = Field(ge=1.0, le=10.0)
     metering_upgrade: bool
     optics_upgrade: bool
     is_point_and_shoot: bool
@@ -139,6 +165,7 @@ async def llm_text_call(
         response_format=_response_format(response_model, schema_name),
         temperature=0,
         max_tokens=512,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     return response_model.model_validate_json(resp.choices[0].message.content or "{}")  # type: ignore[return-value]
 
@@ -165,6 +192,7 @@ async def llm_vision_call(
         response_format=_response_format(response_model, schema_name),
         temperature=0,
         max_tokens=256,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     return response_model.model_validate_json(resp.choices[0].message.content or "{}")  # type: ignore[return-value]
 
@@ -299,142 +327,33 @@ async def extract_text(
 
 
 # ---------------------------------------------------------------------------
-# Stage B: Model specs cache (web search + fetch)
+# Stage B: tool executor (Qwen searches itself)
 # ---------------------------------------------------------------------------
 
-_METERING_PATTERNS = [
-    ("multi", re.compile(r"multi[- ]?(zone|segment|pattern)|evaluative|matrix", re.I)),
-    ("center", re.compile(r"center[- ]?weighted|centre[- ]?weighted", re.I)),
-    ("spot", re.compile(r"\bspot\b", re.I)),
-    ("fixed", re.compile(r"fixed|program|no metering|manual", re.I)),
-]
-_APERTURE_RE = re.compile(r"f[/\s]?(\d+\.?\d*)", re.I)
-_FOCAL_RE = re.compile(r"(\d{2,3})\s*mm", re.I)
-_SLR_RE = re.compile(r"\bSLR\b|\bsingle.?lens.?reflex\b", re.I)
-_AF_RE = re.compile(r"\bautofocus\b|\bauto focus\b|\bAF\b", re.I)
 
-
-def _parse_specs_from_text(text: str) -> dict[str, Any]:
-    specs: dict[str, Any] = {}
-
-    m = _FOCAL_RE.search(text)
-    specs["focal_mm"] = int(m.group(1)) if m else None
-
-    apertures = [float(x) for x in _APERTURE_RE.findall(text)]
-    specs["aperture_max"] = min(apertures) if apertures else None  # smallest f-number = widest
-
-    specs["metering_type"] = None
-    for name, pat in _METERING_PATTERNS:
-        if pat.search(text):
-            specs["metering_type"] = name
-            break
-
-    specs["focus_type"] = "af" if _AF_RE.search(text) else "fixed"
-    specs["is_slr"] = 1 if _SLR_RE.search(text) else 0
-
-    return specs
-
-
-async def _ddgo_search_urls(query: str) -> list[str]:
-    url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
-    try:
-        async with httpx.AsyncClient(headers=DDGO_HEADERS, follow_redirects=True, timeout=15) as http:
-            resp = await http.get(url)
-            resp.raise_for_status()
-    except Exception as e:
-        print(f"  DDGo search error: {e}")
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    urls = []
-    for a in soup.select("a.result__url"):
-        href = a.get("href", "")
-        if href.startswith("http") and "duckduckgo" not in href:
-            urls.append(href)
-    # Fallback: any result__a links
-    if not urls:
-        for a in soup.select("a.result__a"):
-            href = a.get("href", "")
-            if "uddg=" in href:
-                m = re.search(r"uddg=([^&]+)", href)
-                if m:
-                    from urllib.parse import unquote
-                    urls.append(unquote(m.group(1)))
-    return urls[:3]
-
-
-async def fetch_model_specs(
-    canonical_name: str,
-    conn: sqlite3.Connection,
-    lock: asyncio.Lock,
-) -> dict | None:
-    if not canonical_name:
-        return None
-
-    row = conn.execute(
-        "SELECT * FROM model_specs WHERE canonical_name=?", (canonical_name,)
-    ).fetchone()
-    if row:
-        return dict(row)
-
-    query = f"{canonical_name} film camera specifications focal length aperture metering"
-    urls = await _ddgo_search_urls(query)
-
-    specs: dict = {}
-    source_url = ""
-    for url in urls:
-        try:
-            async with httpx.AsyncClient(headers=DDGO_HEADERS, follow_redirects=True, timeout=15) as http:
-                resp = await http.get(url)
-                resp.raise_for_status()
-            text = BeautifulSoup(resp.text, "html.parser").get_text(" ", strip=True)
-            parsed = _parse_specs_from_text(text)
-            # Accept if we found at least aperture or focal length
-            if parsed.get("focal_mm") or parsed.get("aperture_max"):
-                specs = parsed
-                source_url = url
-                break
-        except Exception as e:
-            print(f"  spec fetch error ({url}): {e}")
-
-    parts = canonical_name.split(" ", 1)
-    brand = parts[0] if parts else canonical_name
-
-    async with lock:
-        conn.execute(
-            "INSERT OR IGNORE INTO model_specs "
-            "(canonical_name, brand, focal_mm, aperture_max, metering_type, focus_type, is_slr, specs_source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                canonical_name, brand,
-                specs.get("focal_mm"), specs.get("aperture_max"),
-                specs.get("metering_type"), specs.get("focus_type"),
-                specs.get("is_slr", 0), source_url,
-            ),
-        )
-        conn.commit()
-
-    row = conn.execute(
-        "SELECT * FROM model_specs WHERE canonical_name=?", (canonical_name,)
-    ).fetchone()
-    return dict(row) if row else None
-
-
-async def ensure_pc656_specs(conn: sqlite3.Connection, lock: asyncio.Lock) -> None:
-    """Ensure Premier PC-656 baseline is in model_specs."""
-    existing = conn.execute(
-        "SELECT 1 FROM model_specs WHERE canonical_name='Premier PC-656'"
-    ).fetchone()
-    if existing:
-        return
-    async with lock:
-        conn.execute(
-            "INSERT OR IGNORE INTO model_specs "
-            "(canonical_name, brand, focal_mm, aperture_max, metering_type, focus_type, is_slr, specs_source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            ("Premier PC-656", "Premier", 38, 4.5, "center", "fixed", 0, "hardcoded-baseline"),
-        )
-        conn.commit()
+async def _exec_tool(name: str, args: dict[str, Any]) -> str:
+    """Wykonaj tool przez open-websearch HTTP API (SSH tunnel z Windows)."""
+    async with httpx.AsyncClient(timeout=20) as http:
+        if name == "search":
+            resp = await http.post(f"{SEARCH_BASE_URL}/search", json={
+                "query": args.get("query", ""),
+                "limit": args.get("max_results", 5),
+                "engines": ["startpage"],
+            })
+            data = resp.json()
+            results = data.get("data", {}).get("results", [])
+            return "\n\n".join(
+                f"{r.get('title','')}\n{r.get('url','')}\n{r.get('description','')}"
+                for r in results
+            )
+        elif name == "fetch_content":
+            resp = await http.post(f"{SEARCH_BASE_URL}/fetch-web", json={
+                "url": args.get("url", ""),
+                "maxChars": args.get("max_length", 6000),
+            })
+            data = resp.json()
+            return data.get("data", {}).get("content", "")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +467,6 @@ async def score_listing(
     title: str,
     price: float | None,
     text_ext: TextExtraction,
-    specs: dict[str, Any] | None,
     vision: dict[str, Any] | None,
     client: AsyncOpenAI,
     model: str,
@@ -576,35 +494,66 @@ async def score_listing(
     vision_condition = vision["condition"] if vision else text_ext.condition
     defects = json.loads(vision["defects"]) if vision and vision["defects"] else []
 
-    specs_text = (
-        f"ogniskowa: {specs.get('focal_mm')}mm, "
-        f"przysłona: f/{specs.get('aperture_max')}, "
-        f"pomiar: {specs.get('metering_type')}, "
-        f"fokus: {specs.get('focus_type')}, "
-        f"SLR: {'tak' if specs.get('is_slr') else 'nie'}"
-        if specs else "brak specyfikacji"
-    )
+    # Phase 1: agentic research — Qwen decyduje czy i co szukać (thinking ON)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_SCORING},
+        {
+            "role": "user",
+            "content": (
+                f"Tytuł: {title}\n"
+                f"Cena: {price} PLN\n"
+                f"Model: {text_ext.canonical_name or 'nieznany'} (pewność: {text_ext.model_confidence})\n"
+                f"Stan z opisu: {text_ext.condition} (pewność: {text_ext.condition_confidence})\n"
+                f"Stan wizualny: {vision_condition}, defekty: {defects or 'brak'}\n"
+                f"Premier PC-656 baseline: 38mm f/4.5, stały fokus, pomiar centralny (zawodny)\n\n"
+                "Zbadaj i oceń jako zamiennik dla Premier PC-656."
+            ),
+        },
+    ]
 
-    user_prompt = (
-        f"Tytuł: {title}\n"
-        f"Cena: {price} PLN\n"
-        f"Model: {text_ext.canonical_name or 'nieznany'} "
-        f"(pewność modelu: {text_ext.model_confidence})\n"
-        f"Stan z opisu: {text_ext.condition} (pewność: {text_ext.condition_confidence})\n"
-        f"Stan z wizji: {vision_condition}, defekty: {defects or 'brak'}\n"
-        f"Specyfikacje modelu: {specs_text}\n"
-        f"Premier PC-656 baseline: "
-        f"38mm f/4.5, stały fokus, pomiar centralny (zawodny)\n\n"
-        "Oceń to ogłoszenie jako potencjalny zamiennik."
-    )
+    for _ in range(MAX_TOOL_ROUNDS):
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=DDGO_TOOLS,
+            tool_choice="auto",
+            temperature=0.6,
+            max_tokens=THINKING_BUDGET + 2048,
+            extra_body={"chat_template_kwargs": {"thinking_budget": THINKING_BUDGET}},
+        )
+        msg = resp.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
 
-    result = await llm_text_call(
-        client, model,
-        system=SYSTEM_SCORING,
-        user=user_prompt,
-        response_model=ListingScore,
-        schema_name="listing-score",
+        if not tool_calls:
+            messages.append({"role": "assistant", "content": msg.content})
+            break
+
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in tool_calls
+            ],
+        })
+        for tc in tool_calls:
+            tool_result = await _exec_tool(
+                tc.function.name, json.loads(tc.function.arguments)
+            )
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result[:5000]})
+
+    # Phase 2: ekstrakcja do JSON (thinking OFF)
+    messages.append({"role": "user", "content": "Wypełnij teraz strukturę oceny JSON."})
+    resp2 = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        response_format=_response_format(ListingScore, "listing-score"),
+        temperature=0.1,
+        max_tokens=1024,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
+    result = ListingScore.model_validate_json(resp2.choices[0].message.content or "{}")  # type: ignore[return-value]
 
     async with lock:
         conn.execute(
@@ -613,18 +562,11 @@ async def score_listing(
             "is_point_and_shoot, vibe_90s, condition_ok, recommended, reasoning, skip_reason, model_used) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                listing_id,
-                text_ext.canonical_name,
-                result.overall_score,
-                int(result.metering_upgrade),
-                int(result.optics_upgrade),
-                int(result.is_point_and_shoot),
-                int(result.vibe_90s),
-                int(result.condition_ok),
-                int(result.recommended),
-                result.reasoning,
-                result.skip_reason,
-                model,
+                listing_id, text_ext.canonical_name, result.overall_score,
+                int(result.metering_upgrade), int(result.optics_upgrade),
+                int(result.is_point_and_shoot), int(result.vibe_90s),
+                int(result.condition_ok), int(result.recommended),
+                result.reasoning, result.skip_reason, model,
             ),
         )
         conn.commit()
@@ -665,19 +607,14 @@ async def process_listing(
                 listing_id, title, description, client, model, conn, lock
             )
 
-            # Stage B: model specs
-            specs = None
-            if text_ext.canonical_name:
-                specs = await fetch_model_specs(text_ext.canonical_name, conn, lock)
-
             # Stage C: vision scan (lazy)
             vision = await vision_scan(
                 listing_id, text_ext, all_images, client, model, conn, lock
             )
 
-            # Stage D: scoring
+            # Stage D: agentic scoring (Qwen searches specs + reasons)
             score = await score_listing(
-                listing_id, title, price, text_ext, specs, vision,
+                listing_id, title, price, text_ext, vision,
                 client, model, conn, lock, rescore=rescore,
             )
 
@@ -703,8 +640,6 @@ async def main() -> None:
 
     model = args.model or await get_model_name(client)
     print(f"Using model: {model}")
-
-    await ensure_pc656_specs(conn, lock)
 
     # Listings to process
     if args.rescore:
